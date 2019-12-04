@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/uber/jaeger-client-go/thrift"
 
@@ -34,6 +36,9 @@ const UDPPacketMaxLength = 65000
 type AgentClientUDP struct {
 	agent.Agent
 	io.Closer
+	mtxConn  sync.RWMutex
+	reconnTm int64
+	hostPort string
 
 	connUDP       *net.UDPConn
 	client        *agent.AgentClient
@@ -68,7 +73,8 @@ func NewAgentClientUDP(hostPort string, maxPacketSize int) (*AgentClientUDP, err
 		connUDP:       connUDP,
 		client:        client,
 		maxPacketSize: maxPacketSize,
-		thriftBuffer:  thriftBuffer}
+		thriftBuffer:  thriftBuffer,
+		hostPort:      hostPort}
 	return clientUDP, nil
 }
 
@@ -88,7 +94,34 @@ func (a *AgentClientUDP) EmitBatch(batch *jaeger.Batch) error {
 		return fmt.Errorf("Data does not fit within one UDP packet; size %d, max %d, spans %d",
 			a.thriftBuffer.Len(), a.maxPacketSize, len(batch.Spans))
 	}
+
+	a.mtxConn.RLock()
 	_, err := a.connUDP.Write(a.thriftBuffer.Bytes())
+	a.mtxConn.RUnlock()
+
+	if err != nil {
+		if time.Now().Unix()-a.reconnTm > 10 {
+			a.mtxConn.Lock()
+			defer a.mtxConn.Unlock()
+
+			a.reconnTm = time.Now().Unix()
+			destAddr, err := net.ResolveUDPAddr("udp", a.hostPort)
+			if err != nil {
+				return err
+			}
+
+			connUDP, err := net.DialUDP(destAddr.Network(), nil, destAddr)
+			if err != nil {
+				return err
+			}
+			if err := connUDP.SetWriteBuffer(a.maxPacketSize); err != nil {
+				return err
+			}
+
+			a.connUDP = connUDP
+		}
+	}
+
 	return err
 }
 
